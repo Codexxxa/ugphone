@@ -16,7 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from ugphone_api import attempt_purchase, validate_credentials
+from ugphone_api import attempt_purchase, prepare_credentials
 
 # Define the filter class to suppress NetworkError logs
 class NetworkErrorFilter(logging.Filter):
@@ -75,7 +75,7 @@ class AccountManager:
         with open(self.filename, 'w') as f:
             json.dump(self.accounts, f, indent=4)
 
-    def add_account(self, user_id: int, token: str, ug_id: str) -> str:
+    def add_account(self, user_id: int, token: str, ug_id: str, public_key: str) -> str:
         s_user_id = str(user_id)
         if s_user_id not in self.accounts:
             self.accounts[s_user_id] = []
@@ -86,10 +86,15 @@ class AccountManager:
         for acc in user_accounts:
             if acc['ug_id'] == ug_id:
                 acc['token'] = token
+                acc['public_key'] = public_key
                 self.save_accounts()
                 return "Account updated."
 
-        user_accounts.append({"ug_id": ug_id, "token": token})
+        user_accounts.append({
+            "ug_id": ug_id,
+            "token": token,
+            "public_key": public_key,
+        })
         self.save_accounts()
         return "Account added."
 
@@ -202,16 +207,21 @@ async def process_add_account(update: Update, json_str: str):
 
     msg = await update.message.reply_text("Validating credentials...")
 
-    is_valid, val_msg = await asyncio.get_running_loop().run_in_executor(
-        None, validate_credentials, token, ug_id
+    credential_result = await asyncio.get_running_loop().run_in_executor(
+        None, prepare_credentials, token, ug_id
     )
 
-    if not is_valid:
-        await msg.edit_text(f"❌ Validation Failed: {val_msg}")
+    if not credential_result["success"]:
+        await msg.edit_text(f"❌ Validation Failed: {credential_result['message']}")
         return
 
-    result = account_manager.add_account(user_id, token, ug_id)
-    await msg.edit_text(f"✅ {result} (ID: {ug_id})")
+    web_token = credential_result["access_token"]
+    web_login_id = credential_result["login_id"]
+    public_key = credential_result["public_key"]
+    result = account_manager.add_account(
+        user_id, web_token, web_login_id, public_key
+    )
+    await msg.edit_text(f"✅ {result} (ID: {web_login_id})")
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -275,10 +285,28 @@ async def purchase_job(context: ContextTypes.DEFAULT_TYPE):
         for acc in list(accounts):
             ug_id = acc['ug_id']
             token = acc['token']
+            public_key = acc.get('public_key')
+
+            if not public_key:
+                credential_result = await asyncio.get_running_loop().run_in_executor(
+                    None, prepare_credentials, token, ug_id
+                )
+                if not credential_result["success"]:
+                    logging.error(
+                        f"Could not migrate credentials for account {ug_id}: "
+                        f"{credential_result['message']}"
+                    )
+                    continue
+                token = credential_result["access_token"]
+                ug_id = credential_result["login_id"]
+                public_key = credential_result["public_key"]
+                account_manager.add_account(
+                    user_id, token, ug_id, public_key
+                )
 
             # Run purchase logic
             res = await asyncio.get_running_loop().run_in_executor(
-                None, attempt_purchase, token, ug_id
+                None, attempt_purchase, token, ug_id, public_key
             )
 
             timestamp = datetime.now().strftime("%H:%M:%S")
